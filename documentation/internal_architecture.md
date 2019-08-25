@@ -75,7 +75,7 @@ Whenever the scrape manager receives an updated list of targets for a given scra
 
 ### Target hashing and scrape timing
 
-To spread out scrapes within a scrape pool and in a consistenly slotted way across the `scrape_config`'s scrape interval, each target is [hashed by its label set and its final scrape URL](https://github.com/prometheus/prometheus/blob/v2.3.1/scrape/target.go#L75-L82). This hash is then used to [choose a deterministic offset](https://github.com/prometheus/prometheus/blob/v2.3.1/scrape/target.go#L84-L98) within that interval.
+To spread out scrapes within a scrape pool and in a consistently slotted way across the `scrape_config`'s scrape interval, each target is [hashed by its label set and its final scrape URL](https://github.com/prometheus/prometheus/blob/v2.3.1/scrape/target.go#L75-L82). This hash is then used to [choose a deterministic offset](https://github.com/prometheus/prometheus/blob/v2.3.1/scrape/target.go#L84-L98) within that interval.
 
 ### Target scrapes
 
@@ -93,7 +93,7 @@ Currently rules still read and write directly from/to the fanout storage, but th
 
 ### Local storage
 
-Prometheus's local on-disk time series database is a [light-weight wrapper](https://github.com/prometheus/prometheus/blob/v2.3.1/storage/tsdb/tsdb.go#L102-L106) around [`github.com/prometheus/tsdb.DB`](https://github.com/prometheus/tsdb/blob/master/db.go#L92-L117). The wrapper makes only minor interface adjustments for use of the TSDB in the context of the Prometheus server and implements the [`storage.Storage` interface](https://github.com/prometheus/prometheus/blob/v2.3.1/storage/interface.go#L31-L44). You can find more details about the TSDB's on-disk layout in the [local storage documentation](https://prometheus.io/docs/prometheus/latest/storage/).
+Prometheus's local on-disk time series database is a [light-weight wrapper](https://github.com/prometheus/prometheus/blob/v2.3.1/storage/tsdb/tsdb.go#L102-L106) around [`github.com/prometheus/prometheus/tsdb.DB`](https://github.com/prometheus/prometheus/blob/master/tsdb/db.go#L92-L117). The wrapper makes only minor interface adjustments for use of the TSDB in the context of the Prometheus server and implements the [`storage.Storage` interface](https://github.com/prometheus/prometheus/blob/v2.3.1/storage/interface.go#L31-L44). You can find more details about the TSDB's on-disk layout in the [local storage documentation](https://prometheus.io/docs/prometheus/latest/storage/).
 
 ### Remote storage
 

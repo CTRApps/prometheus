@@ -19,7 +19,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/stretchr/testify/require"
+	"github.com/prometheus/prometheus/util/testutil"
 )
 
 func TestSampleRing(t *testing.T) {
@@ -98,12 +98,12 @@ func TestBufferedSeriesIterator(t *testing.T) {
 			t, v := bit.At()
 			b = append(b, sample{t: t, v: v})
 		}
-		require.Equal(t, exp, b, "buffer mismatch")
+		testutil.Equals(t, exp, b, "buffer mismatch")
 	}
 	sampleEq := func(ets int64, ev float64) {
 		ts, v := it.Values()
-		require.Equal(t, ets, ts, "timestamp mismatch")
-		require.Equal(t, ev, v, "value mismatch")
+		testutil.Equals(t, ets, ts, "timestamp mismatch")
+		testutil.Equals(t, ev, v, "value mismatch")
 	}
 
 	it = NewBufferIterator(newListSeriesIterator([]sample{
@@ -117,29 +117,29 @@ func TestBufferedSeriesIterator(t *testing.T) {
 		{t: 101, v: 10},
 	}), 2)
 
-	require.True(t, it.Seek(-123), "seek failed")
+	testutil.Assert(t, it.Seek(-123), "seek failed")
 	sampleEq(1, 2)
 	bufferEq(nil)
 
-	require.True(t, it.Next(), "next failed")
+	testutil.Assert(t, it.Next(), "next failed")
 	sampleEq(2, 3)
 	bufferEq([]sample{{t: 1, v: 2}})
 
-	require.True(t, it.Next(), "next failed")
-	require.True(t, it.Next(), "next failed")
-	require.True(t, it.Next(), "next failed")
+	testutil.Assert(t, it.Next(), "next failed")
+	testutil.Assert(t, it.Next(), "next failed")
+	testutil.Assert(t, it.Next(), "next failed")
 	sampleEq(5, 6)
 	bufferEq([]sample{{t: 2, v: 3}, {t: 3, v: 4}, {t: 4, v: 5}})
 
-	require.True(t, it.Seek(5), "seek failed")
+	testutil.Assert(t, it.Seek(5), "seek failed")
 	sampleEq(5, 6)
 	bufferEq([]sample{{t: 2, v: 3}, {t: 3, v: 4}, {t: 4, v: 5}})
 
-	require.True(t, it.Seek(101), "seek failed")
+	testutil.Assert(t, it.Seek(101), "seek failed")
 	sampleEq(101, 10)
 	bufferEq([]sample{{t: 99, v: 8}, {t: 100, v: 9}})
 
-	require.False(t, it.Next(), "next succeeded unexpectedly")
+	testutil.Assert(t, !it.Next(), "next succeeded unexpectedly")
 }
 
 // At() should not be called once Next() returns false.
@@ -149,7 +149,7 @@ func TestBufferedSeriesIteratorNoBadAt(t *testing.T) {
 	m := &mockSeriesIterator{
 		seek: func(int64) bool { return false },
 		at: func() (int64, float64) {
-			require.False(t, done)
+			testutil.Assert(t, !done, "unexpectedly done")
 			done = true
 			return 0, 0
 		},
@@ -163,21 +163,8 @@ func TestBufferedSeriesIteratorNoBadAt(t *testing.T) {
 }
 
 func BenchmarkBufferedSeriesIterator(b *testing.B) {
-	var (
-		samples []sample
-		lastT   int64
-	)
-	for i := 0; i < b.N; i++ {
-		lastT += 30
-
-		samples = append(samples, sample{
-			t: lastT,
-			v: 123, // doesn't matter
-		})
-	}
-
 	// Simulate a 5 minute rate.
-	it := NewBufferIterator(newListSeriesIterator(samples), 5*60)
+	it := NewBufferIterator(newFakeSeriesIterator(int64(b.N), 30), 5*60)
 
 	b.SetBytes(int64(b.N * 16))
 	b.ReportAllocs()
@@ -186,7 +173,7 @@ func BenchmarkBufferedSeriesIterator(b *testing.B) {
 	for it.Next() {
 		// scan everything
 	}
-	require.NoError(b, it.Err())
+	testutil.Ok(b, it.Err())
 }
 
 type mockSeriesIterator struct {
@@ -253,5 +240,33 @@ func (it *listSeriesIterator) Seek(t int64) bool {
 }
 
 func (it *listSeriesIterator) Err() error {
+	return nil
+}
+
+type fakeSeriesIterator struct {
+	nsamples int64
+	step     int64
+	idx      int64
+}
+
+func newFakeSeriesIterator(nsamples, step int64) *fakeSeriesIterator {
+	return &fakeSeriesIterator{nsamples: nsamples, step: step, idx: -1}
+}
+
+func (it *fakeSeriesIterator) At() (int64, float64) {
+	return it.idx * it.step, 123 // value doesn't matter
+}
+
+func (it *fakeSeriesIterator) Next() bool {
+	it.idx++
+	return it.idx < it.nsamples
+}
+
+func (it *fakeSeriesIterator) Seek(t int64) bool {
+	it.idx = t / it.step
+	return it.idx < it.nsamples
+}
+
+func (it *fakeSeriesIterator) Err() error {
 	return nil
 }

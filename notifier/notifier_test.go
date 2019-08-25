@@ -14,6 +14,7 @@
 package notifier
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/json"
@@ -25,7 +26,8 @@ import (
 	"testing"
 	"time"
 
-	old_ctx "golang.org/x/net/context"
+	"github.com/prometheus/prometheus/pkg/relabel"
+
 	yaml "gopkg.in/yaml.v2"
 
 	config_util "github.com/prometheus/common/config"
@@ -62,7 +64,7 @@ func TestPostPath(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		testutil.Equals(t, c.out, postPath(c.in))
+		testutil.Equals(t, c.out, postPath(c.in, config.AlertmanagerAPIVersionV1))
 	}
 }
 
@@ -159,9 +161,15 @@ func TestHandlerSendAll(t *testing.T) {
 			Username: "prometheus",
 			Password: "testing_password",
 		},
-	}, "auth_alertmanager")
+	}, "auth_alertmanager", false)
 
 	h.alertmanagers = make(map[string]*alertmanagerSet)
+
+	am1Cfg := config.DefaultAlertmanagerConfig
+	am1Cfg.Timeout = model.Duration(time.Second)
+
+	am2Cfg := config.DefaultAlertmanagerConfig
+	am2Cfg.Timeout = model.Duration(time.Second)
 
 	h.alertmanagers["1"] = &alertmanagerSet{
 		ams: []alertmanager{
@@ -169,9 +177,7 @@ func TestHandlerSendAll(t *testing.T) {
 				urlf: func() string { return server1.URL },
 			},
 		},
-		cfg: &config.AlertmanagerConfig{
-			Timeout: model.Duration(time.Second),
-		},
+		cfg:    &am1Cfg,
 		client: authClient,
 	}
 
@@ -181,9 +187,7 @@ func TestHandlerSendAll(t *testing.T) {
 				urlf: func() string { return server2.URL },
 			},
 		},
-		cfg: &config.AlertmanagerConfig{
-			Timeout: model.Duration(time.Second),
-		},
+		cfg: &am2Cfg,
 	}
 
 	for i := range make([]struct{}, maxBatchSize) {
@@ -212,7 +216,7 @@ func TestCustomDo(t *testing.T) {
 
 	var received bool
 	h := NewManager(&Options{
-		Do: func(ctx old_ctx.Context, client *http.Client, req *http.Request) (*http.Response, error) {
+		Do: func(_ context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
 			received = true
 			body, err := ioutil.ReadAll(req.Body)
 
@@ -223,7 +227,7 @@ func TestCustomDo(t *testing.T) {
 			testutil.Equals(t, testURL, req.URL.String())
 
 			return &http.Response{
-				Body: ioutil.NopCloser(nil),
+				Body: ioutil.NopCloser(bytes.NewBuffer(nil)),
 			}, nil
 		},
 	}, nil)
@@ -236,13 +240,13 @@ func TestCustomDo(t *testing.T) {
 func TestExternalLabels(t *testing.T) {
 	h := NewManager(&Options{
 		QueueCapacity:  3 * maxBatchSize,
-		ExternalLabels: model.LabelSet{"a": "b"},
-		RelabelConfigs: []*config.RelabelConfig{
+		ExternalLabels: labels.Labels{{Name: "a", Value: "b"}},
+		RelabelConfigs: []*relabel.Config{
 			{
 				SourceLabels: model.LabelNames{"alertname"},
 				TargetLabel:  "a",
 				Action:       "replace",
-				Regex:        config.MustNewRegexp("externalrelabelthis"),
+				Regex:        relabel.MustNewRegexp("externalrelabelthis"),
 				Replacement:  "c",
 			},
 		},
@@ -270,17 +274,17 @@ func TestExternalLabels(t *testing.T) {
 func TestHandlerRelabel(t *testing.T) {
 	h := NewManager(&Options{
 		QueueCapacity: 3 * maxBatchSize,
-		RelabelConfigs: []*config.RelabelConfig{
+		RelabelConfigs: []*relabel.Config{
 			{
 				SourceLabels: model.LabelNames{"alertname"},
 				Action:       "drop",
-				Regex:        config.MustNewRegexp("drop"),
+				Regex:        relabel.MustNewRegexp("drop"),
 			},
 			{
 				SourceLabels: model.LabelNames{"alertname"},
 				TargetLabel:  "alertname",
 				Action:       "replace",
-				Regex:        config.MustNewRegexp("rename"),
+				Regex:        relabel.MustNewRegexp("rename"),
 				Replacement:  "renamed",
 			},
 		},
@@ -330,15 +334,16 @@ func TestHandlerQueueing(t *testing.T) {
 
 	h.alertmanagers = make(map[string]*alertmanagerSet)
 
+	am1Cfg := config.DefaultAlertmanagerConfig
+	am1Cfg.Timeout = model.Duration(time.Second)
+
 	h.alertmanagers["1"] = &alertmanagerSet{
 		ams: []alertmanager{
 			alertmanagerMock{
 				urlf: func() string { return server.URL },
 			},
 		},
-		cfg: &config.AlertmanagerConfig{
-			Timeout: model.Duration(time.Second),
-		},
+		cfg: &am1Cfg,
 	}
 
 	var alerts []*Alert
@@ -383,7 +388,7 @@ func TestHandlerQueueing(t *testing.T) {
 	expected = alerts[:maxBatchSize]
 	unblock <- struct{}{}
 
-	for i := 2; i < 4; i++ {
+	for i := 2; i < 5; i++ {
 		select {
 		case <-called:
 			expected = alerts[i*maxBatchSize : (i+1)*maxBatchSize]

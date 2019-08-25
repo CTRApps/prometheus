@@ -21,14 +21,23 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/util/teststorage"
 	"github.com/prometheus/prometheus/util/testutil"
 )
 
 func TestRuleEval(t *testing.T) {
-	storage := testutil.NewStorage(t)
+	storage := teststorage.New(t)
 	defer storage.Close()
 
-	engine := promql.NewEngine(nil, nil, 10, 10*time.Second)
+	opts := promql.EngineOpts{
+		Logger:        nil,
+		Reg:           nil,
+		MaxConcurrent: 10,
+		MaxSamples:    10,
+		Timeout:       10 * time.Second,
+	}
+
+	engine := promql.NewEngine(opts)
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	defer cancelCtx()
 

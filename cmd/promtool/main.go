@@ -14,10 +14,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -25,17 +27,18 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/alecthomas/kingpin.v2"
-	"gopkg.in/yaml.v2"
-
+	"github.com/google/pprof/profile"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/api"
-	"github.com/prometheus/client_golang/api/prometheus/v1"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/version"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
+
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/rulefmt"
-	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/util/promlint"
 )
 
@@ -60,11 +63,8 @@ func main() {
 
 	checkMetricsCmd := checkCmd.Command("metrics", checkMetricsUsage)
 
-	updateCmd := app.Command("update", "Update the resources to newer formats.")
-	updateRulesCmd := updateCmd.Command("rules", "Update rules from the 1.x to 2.x format.")
-	ruleFilesUp := updateRulesCmd.Arg("rule-files", "The rule files to update.").Required().ExistingFiles()
-
 	queryCmd := app.Command("query", "Run query against a Prometheus server.")
+	queryCmdFmt := queryCmd.Flag("format", "Output format of the query.").Short('o').Default("promql").Enum("promql", "json")
 	queryInstantCmd := queryCmd.Command("instant", "Run instant query.")
 	queryServer := queryInstantCmd.Arg("server", "Prometheus server to query.").Required().String()
 	queryExpr := queryInstantCmd.Arg("expr", "PromQL query expression.").Required().String()
@@ -72,6 +72,7 @@ func main() {
 	queryRangeCmd := queryCmd.Command("range", "Run range query.")
 	queryRangeServer := queryRangeCmd.Arg("server", "Prometheus server to query.").Required().String()
 	queryRangeExpr := queryRangeCmd.Arg("expr", "PromQL query expression.").Required().String()
+	queryRangeHeaders := queryRangeCmd.Flag("header", "Extra headers to send to server.").StringMap()
 	queryRangeBegin := queryRangeCmd.Flag("start", "Query range start time (RFC3339 or Unix timestamp).").String()
 	queryRangeEnd := queryRangeCmd.Flag("end", "Query range end time (RFC3339 or Unix timestamp).").String()
 	queryRangeStep := queryRangeCmd.Flag("step", "Query step size (duration).").Duration()
@@ -94,7 +95,24 @@ func main() {
 	queryLabelsServer := queryLabelsCmd.Arg("server", "Prometheus server to query.").Required().URL()
 	queryLabelsName := queryLabelsCmd.Arg("name", "Label name to provide label values for.").Required().String()
 
-	switch kingpin.MustParse(app.Parse(os.Args[1:])) {
+	testCmd := app.Command("test", "Unit testing.")
+	testRulesCmd := testCmd.Command("rules", "Unit tests for rules.")
+	testRulesFiles := testRulesCmd.Arg(
+		"test-rule-file",
+		"The unit test file.",
+	).Required().ExistingFiles()
+
+	parsedCmd := kingpin.MustParse(app.Parse(os.Args[1:]))
+
+	var p printer
+	switch *queryCmdFmt {
+	case "json":
+		p = &jsonPrinter{}
+	case "promql":
+		p = &promqlPrinter{}
+	}
+
+	switch parsedCmd {
 	case checkConfigCmd.FullCommand():
 		os.Exit(CheckConfig(*configFiles...))
 
@@ -104,17 +122,14 @@ func main() {
 	case checkMetricsCmd.FullCommand():
 		os.Exit(CheckMetrics())
 
-	case updateRulesCmd.FullCommand():
-		os.Exit(UpdateRules(*ruleFilesUp...))
-
 	case queryInstantCmd.FullCommand():
-		os.Exit(QueryInstant(*queryServer, *queryExpr))
+		os.Exit(QueryInstant(*queryServer, *queryExpr, p))
 
 	case queryRangeCmd.FullCommand():
-		os.Exit(QueryRange(*queryRangeServer, *queryRangeExpr, *queryRangeBegin, *queryRangeEnd, *queryRangeStep))
+		os.Exit(QueryRange(*queryRangeServer, *queryRangeHeaders, *queryRangeExpr, *queryRangeBegin, *queryRangeEnd, *queryRangeStep, p))
 
 	case querySeriesCmd.FullCommand():
-		os.Exit(QuerySeries(*querySeriesServer, *querySeriesMatch, *querySeriesBegin, *querySeriesEnd))
+		os.Exit(QuerySeries(*querySeriesServer, *querySeriesMatch, *querySeriesBegin, *querySeriesEnd, p))
 
 	case debugPprofCmd.FullCommand():
 		os.Exit(debugPprof(*debugPprofServer))
@@ -126,9 +141,11 @@ func main() {
 		os.Exit(debugAll(*debugAllServer))
 
 	case queryLabelsCmd.FullCommand():
-		os.Exit(QueryLabels(*queryLabelsServer, *queryLabelsName))
-	}
+		os.Exit(QueryLabels(*queryLabelsServer, *queryLabelsName, p))
 
+	case testRulesCmd.FullCommand():
+		os.Exit(RulesUnitTest(*testRulesFiles...))
+	}
 }
 
 // CheckConfig validates configuration files.
@@ -187,10 +204,10 @@ func checkConfig(filename string) ([]string, error) {
 		// If an explicit file was given, error if it is not accessible.
 		if !strings.Contains(rf, "*") {
 			if len(rfs) == 0 {
-				return nil, fmt.Errorf("%q does not point to an existing file", rf)
+				return nil, errors.Errorf("%q does not point to an existing file", rf)
 			}
 			if err := checkFileExists(rfs[0]); err != nil {
-				return nil, fmt.Errorf("error checking rule file %q: %s", rfs[0], err)
+				return nil, errors.Wrapf(err, "error checking rule file %q", rfs[0])
 			}
 		}
 		ruleFiles = append(ruleFiles, rfs...)
@@ -198,7 +215,7 @@ func checkConfig(filename string) ([]string, error) {
 
 	for _, scfg := range cfg.ScrapeConfigs {
 		if err := checkFileExists(scfg.HTTPClientConfig.BearerTokenFile); err != nil {
-			return nil, fmt.Errorf("error checking bearer token file %q: %s", scfg.HTTPClientConfig.BearerTokenFile, err)
+			return nil, errors.Wrapf(err, "error checking bearer token file %q", scfg.HTTPClientConfig.BearerTokenFile)
 		}
 
 		if err := checkTLSConfig(scfg.HTTPClientConfig.TLSConfig); err != nil {
@@ -206,7 +223,7 @@ func checkConfig(filename string) ([]string, error) {
 		}
 
 		for _, kd := range scfg.ServiceDiscoveryConfig.KubernetesSDConfigs {
-			if err := checkTLSConfig(kd.TLSConfig); err != nil {
+			if err := checkTLSConfig(kd.HTTPClientConfig.TLSConfig); err != nil {
 				return nil, err
 			}
 		}
@@ -232,17 +249,17 @@ func checkConfig(filename string) ([]string, error) {
 
 func checkTLSConfig(tlsConfig config_util.TLSConfig) error {
 	if err := checkFileExists(tlsConfig.CertFile); err != nil {
-		return fmt.Errorf("error checking client cert file %q: %s", tlsConfig.CertFile, err)
+		return errors.Wrapf(err, "error checking client cert file %q", tlsConfig.CertFile)
 	}
 	if err := checkFileExists(tlsConfig.KeyFile); err != nil {
-		return fmt.Errorf("error checking client key file %q: %s", tlsConfig.KeyFile, err)
+		return errors.Wrapf(err, "error checking client key file %q", tlsConfig.KeyFile)
 	}
 
 	if len(tlsConfig.CertFile) > 0 && len(tlsConfig.KeyFile) == 0 {
-		return fmt.Errorf("client cert file %q specified without client key file", tlsConfig.CertFile)
+		return errors.Errorf("client cert file %q specified without client key file", tlsConfig.CertFile)
 	}
 	if len(tlsConfig.KeyFile) > 0 && len(tlsConfig.CertFile) == 0 {
-		return fmt.Errorf("client key file %q specified without client cert file", tlsConfig.KeyFile)
+		return errors.Errorf("client key file %q specified without client cert file", tlsConfig.KeyFile)
 	}
 
 	return nil
@@ -286,74 +303,6 @@ func checkRules(filename string) (int, []error) {
 	return numRules, nil
 }
 
-// UpdateRules updates the rule files.
-func UpdateRules(files ...string) int {
-	failed := false
-
-	for _, f := range files {
-		if err := updateRules(f); err != nil {
-			fmt.Fprintln(os.Stderr, "  FAILED:", err)
-			failed = true
-		}
-	}
-
-	if failed {
-		return 1
-	}
-	return 0
-}
-
-func updateRules(filename string) error {
-	fmt.Println("Updating", filename)
-
-	content, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return err
-	}
-
-	rules, err := promql.ParseStmts(string(content))
-	if err != nil {
-		return err
-	}
-
-	yamlRG := &rulefmt.RuleGroups{
-		Groups: []rulefmt.RuleGroup{{
-			Name: filename,
-		}},
-	}
-
-	yamlRules := make([]rulefmt.Rule, 0, len(rules))
-
-	for _, rule := range rules {
-		switch r := rule.(type) {
-		case *promql.AlertStmt:
-			yamlRules = append(yamlRules, rulefmt.Rule{
-				Alert:       r.Name,
-				Expr:        r.Expr.String(),
-				For:         model.Duration(r.Duration),
-				Labels:      r.Labels.Map(),
-				Annotations: r.Annotations.Map(),
-			})
-		case *promql.RecordStmt:
-			yamlRules = append(yamlRules, rulefmt.Rule{
-				Record: r.Name,
-				Expr:   r.Expr.String(),
-				Labels: r.Labels.Map(),
-			})
-		default:
-			panic("unknown statement type")
-		}
-	}
-
-	yamlRG.Groups[0].Rules = yamlRules
-	y, err := yaml.Marshal(yamlRG)
-	if err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(filename+".yml", y, 0666)
-}
-
 var checkMetricsUsage = strings.TrimSpace(`
 Pass Prometheus metrics over stdin to lint them for consistency and correctness.
 
@@ -385,7 +334,7 @@ func CheckMetrics() int {
 }
 
 // QueryInstant performs an instant query against a Prometheus server.
-func QueryInstant(url string, query string) int {
+func QueryInstant(url, query string, p printer) int {
 	config := api.Config{
 		Address: url,
 	}
@@ -401,22 +350,31 @@ func QueryInstant(url string, query string) int {
 	api := v1.NewAPI(c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	val, err := api.Query(ctx, query, time.Now())
+	val, _, err := api.Query(ctx, query, time.Now()) // Ignoring warnings for now.
 	cancel()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "query error:", err)
 		return 1
 	}
 
-	fmt.Println(val.String())
+	p.printValue(val)
 
 	return 0
 }
 
 // QueryRange performs a range query against a Prometheus server.
-func QueryRange(url, query, start, end string, step time.Duration) int {
+func QueryRange(url string, headers map[string]string, query, start, end string, step time.Duration, p printer) int {
 	config := api.Config{
 		Address: url,
+	}
+
+	if len(headers) > 0 {
+		config.RoundTripper = promhttp.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			for key, value := range headers {
+				req.Header.Add(key, value)
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		})
 	}
 
 	// Create new client.
@@ -461,7 +419,7 @@ func QueryRange(url, query, start, end string, step time.Duration) int {
 	api := v1.NewAPI(c)
 	r := v1.Range{Start: stime, End: etime, Step: step}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	val, err := api.QueryRange(ctx, query, r)
+	val, _, err := api.QueryRange(ctx, query, r) // Ignoring warnings for now.
 	cancel()
 
 	if err != nil {
@@ -469,12 +427,12 @@ func QueryRange(url, query, start, end string, step time.Duration) int {
 		return 1
 	}
 
-	fmt.Println(val.String())
+	p.printValue(val)
 	return 0
 }
 
 // QuerySeries queries for a series against a Prometheus server.
-func QuerySeries(url *url.URL, matchers []string, start string, end string) int {
+func QuerySeries(url *url.URL, matchers []string, start, end string, p printer) int {
 	config := api.Config{
 		Address: url.String(),
 	}
@@ -515,7 +473,7 @@ func QuerySeries(url *url.URL, matchers []string, start string, end string) int 
 	// Run query against client.
 	api := v1.NewAPI(c)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	val, err := api.Series(ctx, matchers, stime, etime)
+	val, _, err := api.Series(ctx, matchers, stime, etime) // Ignoring warnings for now.
 	cancel()
 
 	if err != nil {
@@ -523,14 +481,12 @@ func QuerySeries(url *url.URL, matchers []string, start string, end string) int 
 		return 1
 	}
 
-	for _, v := range val {
-		fmt.Println(v)
-	}
+	p.printSeries(val)
 	return 0
 }
 
 // QueryLabels queries for label values against a Prometheus server.
-func QueryLabels(url *url.URL, name string) int {
+func QueryLabels(url *url.URL, name string, p printer) int {
 	config := api.Config{
 		Address: url.String(),
 	}
@@ -545,17 +501,19 @@ func QueryLabels(url *url.URL, name string) int {
 	// Run query against client.
 	api := v1.NewAPI(c)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	val, err := api.LabelValues(ctx, name)
+	val, warn, err := api.LabelValues(ctx, name)
 	cancel()
+
+	for _, v := range warn {
+		fmt.Fprintln(os.Stderr, "query warning:", v)
+	}
 
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "query error:", err)
 		return 1
 	}
 
-	for _, v := range val {
-		fmt.Println(v)
-	}
+	p.printLabelValues(val)
 	return 0
 }
 
@@ -567,62 +525,123 @@ func parseTime(s string) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, nil
 	}
-	return time.Time{}, fmt.Errorf("cannot parse %q to a valid timestamp", s)
+	return time.Time{}, errors.Errorf("cannot parse %q to a valid timestamp", s)
 }
 
-func debugPprof(url string) int {
-	w, err := newDebugWriter(debugWriterConfig{
-		serverURL:   url,
-		tarballName: "debug.tar.gz",
-		pathToFileName: map[string]string{
-			"/debug/pprof/block":        "block.pb",
-			"/debug/pprof/goroutine":    "goroutine.pb",
-			"/debug/pprof/heap":         "heap.pb",
-			"/debug/pprof/mutex":        "mutex.pb",
-			"/debug/pprof/threadcreate": "threadcreate.pb",
+type endpointsGroup struct {
+	urlToFilename map[string]string
+	postProcess   func(b []byte) ([]byte, error)
+}
+
+var (
+	pprofEndpoints = []endpointsGroup{
+		{
+			urlToFilename: map[string]string{
+				"/debug/pprof/profile?seconds=30": "cpu.pb",
+				"/debug/pprof/block":              "block.pb",
+				"/debug/pprof/goroutine":          "goroutine.pb",
+				"/debug/pprof/heap":               "heap.pb",
+				"/debug/pprof/mutex":              "mutex.pb",
+				"/debug/pprof/threadcreate":       "threadcreate.pb",
+			},
+			postProcess: func(b []byte) ([]byte, error) {
+				p, err := profile.Parse(bytes.NewReader(b))
+				if err != nil {
+					return nil, err
+				}
+				var buf bytes.Buffer
+				if err := p.WriteUncompressed(&buf); err != nil {
+					return nil, errors.Wrap(err, "writing the profile to the buffer")
+				}
+
+				return buf.Bytes(), nil
+			},
 		},
-		postProcess: pprofPostProcess,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error creating debug writer:", err)
+		{
+			urlToFilename: map[string]string{
+				"/debug/pprof/trace?seconds=30": "trace.pb",
+			},
+		},
+	}
+	metricsEndpoints = []endpointsGroup{
+		{
+			urlToFilename: map[string]string{
+				"/metrics": "metrics.txt",
+			},
+		},
+	}
+	allEndpoints = append(pprofEndpoints, metricsEndpoints...)
+)
+
+func debugPprof(url string) int {
+	if err := debugWrite(debugWriterConfig{
+		serverURL:      url,
+		tarballName:    "debug.tar.gz",
+		endPointGroups: pprofEndpoints,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "error completing debug command:", err)
 		return 1
 	}
-	return w.Write()
+	return 0
 }
 
 func debugMetrics(url string) int {
-	w, err := newDebugWriter(debugWriterConfig{
-		serverURL:   url,
-		tarballName: "debug.tar.gz",
-		pathToFileName: map[string]string{
-			"/metrics": "metrics.txt",
-		},
-		postProcess: metricsPostProcess,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error creating debug writer:", err)
+	if err := debugWrite(debugWriterConfig{
+		serverURL:      url,
+		tarballName:    "debug.tar.gz",
+		endPointGroups: metricsEndpoints,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "error completing debug command:", err)
 		return 1
 	}
-	return w.Write()
+	return 0
 }
 
 func debugAll(url string) int {
-	w, err := newDebugWriter(debugWriterConfig{
-		serverURL:   url,
-		tarballName: "debug.tar.gz",
-		pathToFileName: map[string]string{
-			"/debug/pprof/block":        "block.pb",
-			"/debug/pprof/goroutine":    "goroutine.pb",
-			"/debug/pprof/heap":         "heap.pb",
-			"/debug/pprof/mutex":        "mutex.pb",
-			"/debug/pprof/threadcreate": "threadcreate.pb",
-			"/metrics":                  "metrics.txt",
-		},
-		postProcess: allPostProcess,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error creating debug writer:", err)
+	if err := debugWrite(debugWriterConfig{
+		serverURL:      url,
+		tarballName:    "debug.tar.gz",
+		endPointGroups: allEndpoints,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "error completing debug command:", err)
 		return 1
 	}
-	return w.Write()
+	return 0
+}
+
+type printer interface {
+	printValue(v model.Value)
+	printSeries(v []model.LabelSet)
+	printLabelValues(v model.LabelValues)
+}
+
+type promqlPrinter struct{}
+
+func (p *promqlPrinter) printValue(v model.Value) {
+	fmt.Println(v)
+}
+func (p *promqlPrinter) printSeries(val []model.LabelSet) {
+	for _, v := range val {
+		fmt.Println(v)
+	}
+}
+func (p *promqlPrinter) printLabelValues(val model.LabelValues) {
+	for _, v := range val {
+		fmt.Println(v)
+	}
+}
+
+type jsonPrinter struct{}
+
+func (j *jsonPrinter) printValue(v model.Value) {
+	//nolint:errcheck
+	json.NewEncoder(os.Stdout).Encode(v)
+}
+func (j *jsonPrinter) printSeries(v []model.LabelSet) {
+	//nolint:errcheck
+	json.NewEncoder(os.Stdout).Encode(v)
+}
+func (j *jsonPrinter) printLabelValues(v model.LabelValues) {
+	//nolint:errcheck
+	json.NewEncoder(os.Stdout).Encode(v)
 }
